@@ -1,0 +1,13 @@
+# Ignore the virtual environment dependencies
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Ignore raw data files to prevent GitHub repository bloating
+data/raw/
+*.csv
+
+# Ignore VS Code configuration files
+.vscode/
+.DS_Store
