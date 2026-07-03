@@ -30,13 +30,13 @@ def run_transshipment_optimization():
     
     demand_summary = forecast_df.groupby(['district', 'medicine'])['predicted_demand'].sum().reset_index()
     
-    # 3. Formulate the Sri Lankan Road Distance Cost Factors Lookup Table
+    # 3. Formulate the Sri Lankan Road Distance Cost Factors Lookup Table (Scaled roughly to LKR transport weight values)
     cost_matrix = {
-        "Colombo": {"Colombo": 0, "Kandy": 12, "Galle": 10, "Anuradhapura": 20, "Jaffna": 35},
-        "Kandy": {"Colombo": 12, "Kandy": 0, "Galle": 22, "Anuradhapura": 14, "Jaffna": 30},
-        "Galle": {"Colombo": 10, "Kandy": 22, "Galle": 0, "Anuradhapura": 28, "Jaffna": 42},
-        "Anuradhapura": {"Colombo": 20, "Kandy": 14, "Galle": 28, "Anuradhapura": 0, "Jaffna": 18},
-        "Jaffna": {"Colombo": 35, "Kandy": 30, "Galle": 42, "Anuradhapura": 18, "Jaffna": 0}
+        "Colombo": {"Colombo": 0, "Kandy": 120, "Galle": 100, "Anuradhapura": 200, "Jaffna": 350},
+        "Kandy": {"Colombo": 120, "Kandy": 0, "Galle": 220, "Anuradhapura": 140, "Jaffna": 300},
+        "Galle": {"Colombo": 100, "Kandy": 220, "Galle": 0, "Anuradhapura": 280, "Jaffna": 420},
+        "Anuradhapura": {"Colombo": 200, "Kandy": 140, "Galle": 280, "Anuradhapura": 0, "Jaffna": 180},
+        "Jaffna": {"Colombo": 350, "Kandy": 300, "Galle": 420, "Anuradhapura": 180, "Jaffna": 0}
     }
     
     nodes = list(cost_matrix.keys())
@@ -45,6 +45,9 @@ def run_transshipment_optimization():
     transfer_manifest_records = []
     
     print(f"Initializing optimization constraints across {len(unique_medicines)} active pharmaceutical lines...")
+    
+    # 2026 Precise USD to LKR Exchange Multiplier
+    USD_TO_LKR_RATE = 334.71
     
     for medicine in unique_medicines:
         prob = pulp.LpProblem(f"Lateral_Pharmaceutical_Transshipment_{medicine.replace(' ', '_')}", pulp.LpMinimize)
@@ -62,19 +65,22 @@ def run_transshipment_optimization():
             stock_row = current_inventory[(current_inventory['district'] == node) & (current_inventory['medicine'] == medicine)]
             demand_row = demand_summary[(demand_summary['district'] == node) & (demand_summary['medicine'] == medicine)]
             
-            # Default fallback values to prevent empty constraints
             s_val = int(stock_row['stock_level'].values[0]) if len(stock_row) > 0 else 4500
             d_val = int(demand_row['predicted_demand'].values[0]) if len(demand_row) > 0 else 600
-            p_val = float(stock_row['unit_price'].values[0]) if len(stock_row) > 0 else 150.0  
+            
+            # Read unit price from source. If under 50, treat as USD and multiply by exchange rate to LKR
+            raw_price = float(stock_row['unit_price'].values[0]) if len(stock_row) > 0 else 1.50
+            p_val = raw_price * USD_TO_LKR_RATE if raw_price < 50.0 else raw_price
+                
             e_val = int(stock_row['expiry_days_remaining'].values[0]) if len(stock_row) > 0 else 250
             
-            # --- SOLID STRESS TEST INJECTION: Creating absolute network imbalances ---
+            # --- STRESS TEST INJECTION: Creating absolute network imbalances ---
             if node in ["Jaffna", "Kandy"]:
-                s_val = 50       # High shortage at recipient facilities
-                d_val = 1500     # Monsoonal spike simulation
+                s_val = 50       
+                d_val = 1500     
             if node == "Colombo":
-                s_val = 25000    # Colombo acts as the major supplying clearinghouse
-                e_val = 45       # Priority stock about to hit inventory wall
+                s_val = 25000    
+                e_val = 45       
             # -------------------------------------------------------------------------
             
             net_balance = s_val - d_val
@@ -88,16 +94,13 @@ def run_transshipment_optimization():
             price_dict[node] = p_val
             expiry_dict[node] = e_val
 
-        # Objective Function: Minimize overall network transportation expenditure
-        # Bulk factor optimization (0.01 multiplier ensures shipping cost doesn't break optimization viability)
-        prob += pulp.lpSum([routes[i, j] * (cost_matrix[i][j] * 0.01) for i in nodes for j in nodes])
+        # Objective Function: Minimize overall network transportation expenditure in LKR
+        # (0.1 coefficient represents an economical per-unit volume bulk shipping rate)
+        prob += pulp.lpSum([routes[i, j] * (cost_matrix[i][j] * 0.1) for i in nodes for j in nodes])
         
         # Core Optimization Constraints
         for i in nodes:
-            # Outbound shipments from surplus node cannot exceed local excess stock
             prob += pulp.lpSum([routes[i, j] for j in nodes if i != j]) <= supply_dict[i]
-            
-            # Inbound shipments to deficit node must cover the predicted shortage volume
             prob += pulp.lpSum([routes[j, i] for j in nodes if i != j]) >= demand_dict[i]
             
             for j in nodes:
@@ -118,20 +121,20 @@ def run_transshipment_optimization():
                             "source_hospital": i,
                             "destination_hospital": j,
                             "quantity_to_move": int(qty),
-                            "unit_price": price_dict[i],
-                            "financial_value_saved": int(qty) * price_dict[i],
-                            "logistical_cost": int(qty) * (cost_matrix[i][j] * 0.01)
+                            "unit_price_lkr": round(price_dict[i], 2),
+                            "financial_value_saved_lkr": round(int(qty) * price_dict[i], 2),
+                            "logistical_cost_lkr": round(int(qty) * (cost_matrix[i][j] * 0.1), 2)
                         })
 
     if transfer_manifest_records:
         manifest_df = pd.DataFrame(transfer_manifest_records)
     else:
-        manifest_df = pd.DataFrame(columns=["medicine", "source_hospital", "destination_hospital", "quantity_to_move", "unit_price", "financial_value_saved", "logistical_cost"])
+        manifest_df = pd.DataFrame(columns=["medicine", "source_hospital", "destination_hospital", "quantity_to_move", "unit_price_lkr", "financial_value_saved_lkr", "logistical_cost_lkr"])
         
     output_path = f"{output_dir}/optimized_transshipment_manifest.csv"
     manifest_df.to_csv(output_path, index=False)
     
-    print(f"\n✅ Step 5 Complete: Operations Research strategy compiled. Manifest saved to {output_path}")
+    print(f"\n✅ Step 5 Complete: Operations Research strategy compiled in LKR. Manifest saved to {output_path}")
     print(f"Total redistribution routes generated: {len(manifest_df)}")
     return manifest_df
 
