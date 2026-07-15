@@ -16,8 +16,23 @@ from src.optimization_engine import run_transshipment_optimization
 app = FastAPI(
     title="Climate-Responsive Lateral Pharmaceutical Transshipment API Backend",
     description="A centralized Object-Oriented Software Engineering framework linking predictive AI with Operations Research",
-    version="1.0.0"
+    version="1.0.0",
+    docs_url="/",
+    redoc_url=None,
+    openapi_url="/openapi.json"
 )
+
+@app.get("/health", tags=["Root"])
+def read_root():
+    """Simple health endpoint to verify server startup and provide quick links."""
+    return {
+        "message": "MedTransship API is running.",
+        "endpoints": [
+            "/api/pipeline/run-all",
+            "/api/dashboard/manifest",
+            "/api/dashboard/forecast-summary",
+        ],
+    }
 
 # Enable Cross-Origin Resource Sharing (CORS) so your Next.js dashboard can connect without block policies
 app.add_middleware(
@@ -28,7 +43,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.post("/api/pipeline/run-all", tags=["Core Pipeline Orchestration"])
+@app.api_route("/api/pipeline/run-all", methods=["GET", "POST"], tags=["Core Pipeline Orchestration"])
 def execute_system_pipeline():
     """
     Executes Phase 1, Phase 2, and Phase 3 of the framework consecutively.
