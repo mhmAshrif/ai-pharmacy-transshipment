@@ -22,6 +22,9 @@ app = FastAPI(
     openapi_url="/openapi.json"
 )
 
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(BASE_DIR, "data", "processed")
+
 @app.get("/health", tags=["Root"])
 def read_root():
     """Simple health endpoint to verify server startup and provide quick links."""
@@ -73,7 +76,7 @@ def get_optimized_manifest():
     """
     Delivers the compiled operations research transshipment records to the Next.js frontend UI tables.
     """
-    path = "data/processed/optimized_transshipment_manifest.csv"
+    path = os.path.join(DATA_DIR, "optimized_transshipment_manifest.csv")
     if not os.path.exists(path):
         return {
             "message": "No active manifest dataset calculated yet. Execute /run-all first.", 
@@ -82,7 +85,6 @@ def get_optimized_manifest():
     
     try:
         manifest_df = pd.read_csv(path)
-        # Convert the dataframe to a clean JSON array structure for web rendering
         records = manifest_df.to_dict(orient="records")
         return {
             "count": len(records),
@@ -91,12 +93,86 @@ def get_optimized_manifest():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read data matrix: {str(e)}")
 
+@app.get("/api/dashboard/metrics", tags=["Data Delivery Endpoints"])
+def get_dashboard_metrics():
+    """Returns the summary KPI numbers used on the overview dashboard."""
+    manifest_path = os.path.join(DATA_DIR, "optimized_transshipment_manifest.csv")
+    if not os.path.exists(manifest_path):
+        return {"total_savings": 0, "stock_saved": 0, "active_manifests": 0}
+
+    try:
+        manifest_df = pd.read_csv(manifest_path)
+        total_savings = float(manifest_df["financial_value_saved_lkr"].sum()) if "financial_value_saved_lkr" in manifest_df.columns else 0.0
+        stock_saved = int(manifest_df["quantity_to_move"].sum()) if "quantity_to_move" in manifest_df.columns else 0
+        active_manifests = int(len(manifest_df))
+
+        return {
+            "total_savings": round(total_savings, 2),
+            "stock_saved": stock_saved,
+            "active_manifests": active_manifests,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to compute dashboard metrics: {str(e)}")
+
+@app.get("/api/dashboard/alerts", tags=["Data Delivery Endpoints"])
+def get_dashboard_alerts():
+    """Returns inventory alerts for the dashboard warning feed."""
+    alerts_path = os.path.join(DATA_DIR, "fused_master_dataset.csv")
+    if not os.path.exists(alerts_path):
+        return []
+
+    try:
+        alerts_df = pd.read_csv(alerts_path)
+        warnings = alerts_df[(alerts_df["expiry_days_remaining"] < 60) | (alerts_df["stock_level"] < 500)].copy()
+        if warnings.empty:
+            warnings = alerts_df.head(8).copy()
+
+        warnings = warnings.sort_values(["expiry_days_remaining", "stock_level"]).head(8)
+        records = []
+        for idx, row in warnings.iterrows():
+            records.append({
+                "id": idx + 1,
+                "district": str(row.get("district", "Unknown")),
+                "medicine": str(row.get("medicine", "Unknown")),
+                "stock_level": int(row.get("stock_level", 0)),
+                "expiry_days_remaining": int(row.get("expiry_days_remaining", 0)),
+            })
+        return records
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate alerts: {str(e)}")
+
+@app.get("/api/dashboard/chart", tags=["Data Delivery Endpoints"])
+def get_dashboard_chart():
+    """Returns time-series values for the climate correlation chart widget."""
+    chart_path = os.path.join(DATA_DIR, "fused_master_dataset.csv")
+    if not os.path.exists(chart_path):
+        return []
+
+    try:
+        chart_df = pd.read_csv(chart_path)
+        chart_df["date"] = pd.to_datetime(chart_df["date"], errors="coerce")
+        chart_df = chart_df.dropna(subset=["date"])
+
+        summary = (
+            chart_df.groupby(chart_df["date"].dt.date)
+            .agg(units_sold=("units_sold", "sum"), precipitation_sum=("precipitation_sum", "mean"))
+            .reset_index()
+        )
+        summary = summary.sort_values("date").head(20)
+        summary["time"] = summary["date"].astype(str)
+        summary["units_sold"] = summary["units_sold"].astype(float).round(2)
+        summary["precipitation_sum"] = summary["precipitation_sum"].astype(float).round(2)
+
+        return summary[["time", "units_sold", "precipitation_sum"]].to_dict(orient="records")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to build chart data: {str(e)}")
+
 @app.get("/api/dashboard/forecast-summary", tags=["Data Delivery Endpoints"])
 def get_forecast_summary():
     """
     Exposes aggregated target climate-aware demand predictions grouped per district node for high-level graph charts.
     """
-    path = "data/processed/upcoming_demand_forecasts.csv"
+    path = os.path.join(DATA_DIR, "upcoming_demand_forecasts.csv")
     if not os.path.exists(path):
         return {"message": "No predictive targets found.", "data": []}
     
