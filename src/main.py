@@ -167,6 +167,24 @@ def get_dashboard_chart():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to build chart data: {str(e)}")
 
+@app.get("/api/inventory", tags=["Data Delivery Endpoints"])
+def get_inventory_records():
+    """Returns the current inventory ledger rows used by the inventory page."""
+    inventory_path = os.path.join(DATA_DIR, "fused_master_dataset.csv")
+    if not os.path.exists(inventory_path):
+        return []
+
+    try:
+        inventory_df = pd.read_csv(inventory_path)
+        inventory_df = inventory_df[["district", "medicine", "category", "stock_level", "expiry_days_remaining", "unit_price"]].copy()
+        inventory_df = inventory_df.drop_duplicates().reset_index(drop=True)
+        inventory_df["stock_level"] = inventory_df["stock_level"].astype(int)
+        inventory_df["expiry_days_remaining"] = inventory_df["expiry_days_remaining"].astype(int)
+        inventory_df["unit_price"] = inventory_df["unit_price"].astype(float)
+        return inventory_df.to_dict(orient="records")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read inventory data: {str(e)}")
+
 @app.get("/api/dashboard/forecast-summary", tags=["Data Delivery Endpoints"])
 def get_forecast_summary():
     """
