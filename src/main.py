@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import os
 import sys
+import math
 
 # Append the project root to path to ensure crisp absolute internal source imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -184,6 +185,100 @@ def get_inventory_records():
         return inventory_df.to_dict(orient="records")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read inventory data: {str(e)}")
+
+@app.get("/api/forecast/options", tags=["Forecasting Endpoints"])
+def get_forecast_options():
+    """Returns the available medicines and districts for the forecast form controls."""
+    forecast_path = os.path.join(DATA_DIR, "upcoming_demand_forecasts.csv")
+    historical_path = os.path.join(DATA_DIR, "fused_master_dataset.csv")
+
+    medicines = []
+    districts = []
+
+    if os.path.exists(forecast_path):
+        forecast_df = pd.read_csv(forecast_path)
+        medicines = sorted([str(item) for item in forecast_df["medicine"].dropna().astype(str).unique() if str(item).strip()])
+        districts = sorted([str(item) for item in forecast_df["district"].dropna().astype(str).unique() if str(item).strip()])
+
+    if not medicines and os.path.exists(historical_path):
+        historical_df = pd.read_csv(historical_path)
+        medicines = sorted([str(item) for item in historical_df["medicine"].dropna().astype(str).unique() if str(item).strip()])
+        districts = sorted([str(item) for item in historical_df["district"].dropna().astype(str).unique() if str(item).strip()])
+
+    return {
+        "medicines": medicines,
+        "districts": districts,
+    }
+
+@app.get("/api/forecast", tags=["Forecasting Endpoints"])
+def get_forecast_series(medicine: str, district: str):
+    """Returns historical actuals and future prophet forecasts for the selected medicine and district."""
+    historical_path = os.path.join(DATA_DIR, "fused_master_dataset.csv")
+    forecast_path = os.path.join(DATA_DIR, "upcoming_demand_forecasts.csv")
+
+    if not os.path.exists(historical_path) or not os.path.exists(forecast_path):
+        return []
+
+    try:
+        historical_df = pd.read_csv(historical_path)
+        forecast_df = pd.read_csv(forecast_path)
+
+        historical_subset = historical_df[
+            (historical_df["medicine"].astype(str).str.lower() == medicine.lower()) &
+            (historical_df["district"].astype(str).str.lower() == district.lower())
+        ].copy()
+
+        forecast_subset = forecast_df[
+            (forecast_df["medicine"].astype(str).str.lower() == medicine.lower()) &
+            (forecast_df["district"].astype(str).str.lower() == district.lower())
+        ].copy()
+
+        if historical_subset.empty and forecast_subset.empty:
+            return []
+
+        historical_subset = historical_subset[["date", "units_sold", "precipitation_sum"]].copy()
+        historical_subset["time"] = historical_subset["date"].astype(str)
+        historical_subset["units_sold"] = pd.to_numeric(historical_subset["units_sold"], errors="coerce")
+        historical_subset["predicted_demand"] = None
+        historical_subset["precipitation_sum"] = pd.to_numeric(historical_subset["precipitation_sum"], errors="coerce")
+
+        forecast_subset = forecast_subset[["date", "predicted_demand", "district", "medicine"]].copy()
+        forecast_subset = forecast_subset.rename(columns={"date": "time"})
+        forecast_subset["units_sold"] = None
+        forecast_subset["precipitation_sum"] = None
+        forecast_subset["predicted_demand"] = pd.to_numeric(forecast_subset["predicted_demand"], errors="coerce")
+
+        combined = pd.concat([historical_subset, forecast_subset], ignore_index=True)
+        combined["time"] = combined["time"].astype(str)
+        combined = combined.sort_values("time").reset_index(drop=True)
+
+        def to_json_safe_value(value):
+            if value is None:
+                return None
+            if isinstance(value, str):
+                return value
+            if pd.isna(value):
+                return None
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(numeric_value):
+                return None
+            return numeric_value
+
+        records = []
+        for _, row in combined.iterrows():
+            records.append({
+                "time": str(row["time"]),
+                "units_sold": to_json_safe_value(row["units_sold"]),
+                "predicted_demand": to_json_safe_value(row["predicted_demand"]),
+                "precipitation_sum": to_json_safe_value(row["precipitation_sum"]),
+            })
+
+        return records
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to build forecast series: {str(e)}")
 
 @app.get("/api/dashboard/forecast-summary", tags=["Data Delivery Endpoints"])
 def get_forecast_summary():
