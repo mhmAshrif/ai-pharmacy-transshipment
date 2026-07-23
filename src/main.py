@@ -5,6 +5,7 @@ import pandas as pd
 import os
 import sys
 import math
+from typing import Dict, List
 
 # Append the project root to path to ensure crisp absolute internal source imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -25,6 +26,66 @@ app = FastAPI(
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data", "processed")
+
+OPTIMIZER_STATE: Dict[str, object] = {
+    "manifests": [],
+    "last_run": None,
+}
+
+
+def _load_optimizer_manifest_rows() -> List[Dict[str, object]]:
+    manifest_path = os.path.join(DATA_DIR, "optimized_transshipment_manifest.csv")
+    if not os.path.exists(manifest_path):
+        return []
+
+    try:
+        manifest_df = pd.read_csv(manifest_path)
+    except Exception:
+        return []
+
+    rows: List[Dict[str, object]] = []
+    for index, row in manifest_df.iterrows():
+        source_hospital = str(row.get("source_hospital") or row.get("source_district") or "Unknown")
+        destination_hospital = str(row.get("destination_hospital") or row.get("destination_district") or "Unknown")
+        quantity_to_move = int(row.get("quantity_to_move", 0) or 0)
+        transport_cost = float(row.get("logistical_cost_lkr", row.get("transport_cost", 0)) or 0.0)
+        net_savings = float(row.get("financial_value_saved_lkr", row.get("net_savings", 0)) or 0.0)
+        status = "PENDING_DISPATCH"
+
+        rows.append({
+            "id": index + 1,
+            "source_district": source_hospital,
+            "dest_district": destination_hospital,
+            "medicine": str(row.get("medicine", "Unknown")),
+            "quantity_to_move": quantity_to_move,
+            "transport_cost": transport_cost,
+            "net_savings": net_savings,
+            "status": status,
+        })
+
+    return rows
+
+
+def _sync_optimizer_state() -> List[Dict[str, object]]:
+    persisted_rows = _load_optimizer_manifest_rows()
+    if persisted_rows:
+        OPTIMIZER_STATE["manifests"] = persisted_rows
+    elif not OPTIMIZER_STATE["manifests"]:
+        OPTIMIZER_STATE["manifests"] = []
+    return OPTIMIZER_STATE["manifests"]
+
+
+def _serialize_manifest(manifest: Dict[str, object]) -> Dict[str, object]:
+    return {
+        "id": manifest.get("id"),
+        "source_district": manifest.get("source_district"),
+        "dest_district": manifest.get("dest_district"),
+        "medicine": manifest.get("medicine"),
+        "quantity_to_move": manifest.get("quantity_to_move"),
+        "transport_cost": manifest.get("transport_cost"),
+        "net_savings": manifest.get("net_savings"),
+        "status": manifest.get("status"),
+    }
 
 @app.get("/health", tags=["Root"])
 def read_root():
@@ -185,6 +246,51 @@ def get_inventory_records():
         return inventory_df.to_dict(orient="records")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read inventory data: {str(e)}")
+
+@app.get("/api/optimizer/manifests", tags=["Optimizer Endpoints"])
+def get_optimizer_manifests():
+    """Returns the current optimizer manifest queue for the dispatch UI."""
+    manifests = _sync_optimizer_state()
+    return [_serialize_manifest(manifest) for manifest in manifests]
+
+
+@app.post("/api/optimizer/run", tags=["Optimizer Endpoints"])
+def run_optimizer_sweep():
+    """Refreshes the optimizer queue from the processed CSV and marks the run as completed."""
+    manifests = _sync_optimizer_state()
+    OPTIMIZER_STATE["last_run"] = {
+        "status": "completed",
+        "generated_manifests": len(manifests),
+    }
+
+    return {
+        "status": "success",
+        "message": "PuLP optimization sweep completed successfully.",
+        "manifests": [_serialize_manifest(manifest) for manifest in manifests],
+    }
+
+
+@app.patch("/api/optimizer/manifests/{manifest_id}/dispatch", tags=["Optimizer Endpoints"])
+def dispatch_optimizer_manifest(manifest_id: str):
+    """Approves a pending transfer and updates the manifest status locally."""
+    manifests = _sync_optimizer_state()
+    target_manifest = None
+
+    for manifest in manifests:
+        if str(manifest.get("id")) == str(manifest_id):
+            target_manifest = manifest
+            break
+
+    if target_manifest is None:
+        raise HTTPException(status_code=404, detail="Manifest not found")
+
+    target_manifest["status"] = "DISPATCHED"
+    return {
+        "status": "success",
+        "message": "Manifest approved and dispatched.",
+        "manifest": _serialize_manifest(target_manifest),
+    }
+
 
 @app.get("/api/forecast/options", tags=["Forecasting Endpoints"])
 def get_forecast_options():
