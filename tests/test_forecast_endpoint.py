@@ -9,8 +9,11 @@ def test_forecast_endpoint_returns_json():
     response = client.get('/api/forecast', params={'medicine': 'Amlodipine', 'district': 'Colombo'})
     assert response.status_code == 200
     payload = response.json()
-    assert isinstance(payload, list)
-    assert len(payload) > 0
+    assert isinstance(payload, dict)
+    assert isinstance(payload.get('metrics'), dict)
+    assert {'rmse', 'mae', 'mape_percent'} <= set(payload['metrics'].keys())
+    assert isinstance(payload.get('chart_data'), list)
+    assert len(payload['chart_data']) > 0
 
 
 def test_optimizer_routes_return_manifests_and_dispatch_updates_status():

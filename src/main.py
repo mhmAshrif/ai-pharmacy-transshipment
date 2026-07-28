@@ -12,7 +12,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import your working functional script methods
 from src.data_pipeline import fuse_healthcare_data
-from src.forecast_engine import generate_demand_forecasts
+from src.forecast_engine import build_prophet_forecast, generate_demand_forecasts
 from src.optimization_engine import run_transshipment_optimization
 
 app = FastAPI(
@@ -318,45 +318,41 @@ def get_forecast_options():
 
 @app.get("/api/forecast", tags=["Forecasting Endpoints"])
 def get_forecast_series(medicine: str, district: str):
-    """Returns historical actuals and future prophet forecasts for the selected medicine and district."""
+    """Returns evaluation metrics and a chart-ready series for the selected medicine and district."""
     historical_path = os.path.join(DATA_DIR, "fused_master_dataset.csv")
-    forecast_path = os.path.join(DATA_DIR, "upcoming_demand_forecasts.csv")
 
-    if not os.path.exists(historical_path) or not os.path.exists(forecast_path):
-        return []
+    if not os.path.exists(historical_path):
+        return {
+            "metrics": {"rmse": 0.0, "mae": 0.0, "mape_percent": 0.0},
+            "chart_data": [],
+        }
 
     try:
         historical_df = pd.read_csv(historical_path)
-        forecast_df = pd.read_csv(forecast_path)
+        historical_df["date"] = pd.to_datetime(historical_df["date"], errors="coerce")
+        historical_df = historical_df.dropna(subset=["date"]).reset_index(drop=True)
 
         historical_subset = historical_df[
             (historical_df["medicine"].astype(str).str.lower() == medicine.lower()) &
             (historical_df["district"].astype(str).str.lower() == district.lower())
         ].copy()
 
-        forecast_subset = forecast_df[
-            (forecast_df["medicine"].astype(str).str.lower() == medicine.lower()) &
-            (forecast_df["district"].astype(str).str.lower() == district.lower())
-        ].copy()
+        if historical_subset.empty:
+            return {
+                "metrics": {"rmse": 0.0, "mae": 0.0, "mape_percent": 0.0},
+                "chart_data": [],
+            }
 
-        if historical_subset.empty and forecast_subset.empty:
-            return []
+        model_payload = build_prophet_forecast(
+            district=district,
+            medicine=medicine,
+            historical_df=historical_df,
+            forecast_horizon=30,
+        )
 
+        future_predictions = model_payload["future_predictions"].copy()
         historical_subset = historical_subset[["date", "units_sold", "precipitation_sum"]].copy()
-        historical_subset["time"] = historical_subset["date"].astype(str)
-        historical_subset["units_sold"] = pd.to_numeric(historical_subset["units_sold"], errors="coerce")
-        historical_subset["predicted_demand"] = None
-        historical_subset["precipitation_sum"] = pd.to_numeric(historical_subset["precipitation_sum"], errors="coerce")
-
-        forecast_subset = forecast_subset[["date", "predicted_demand", "district", "medicine"]].copy()
-        forecast_subset = forecast_subset.rename(columns={"date": "time"})
-        forecast_subset["units_sold"] = None
-        forecast_subset["precipitation_sum"] = None
-        forecast_subset["predicted_demand"] = pd.to_numeric(forecast_subset["predicted_demand"], errors="coerce")
-
-        combined = pd.concat([historical_subset, forecast_subset], ignore_index=True)
-        combined["time"] = combined["time"].astype(str)
-        combined = combined.sort_values("time").reset_index(drop=True)
+        historical_subset = historical_subset.sort_values("date").reset_index(drop=True)
 
         def to_json_safe_value(value):
             if value is None:
@@ -374,15 +370,28 @@ def get_forecast_series(medicine: str, district: str):
             return numeric_value
 
         records = []
-        for _, row in combined.iterrows():
+        for _, row in historical_subset.iterrows():
             records.append({
-                "time": str(row["time"]),
+                "time": row["date"].strftime("%Y-%m-%d"),
                 "units_sold": to_json_safe_value(row["units_sold"]),
-                "predicted_demand": to_json_safe_value(row["predicted_demand"]),
+                "predicted_demand": None,
                 "precipitation_sum": to_json_safe_value(row["precipitation_sum"]),
             })
 
-        return records
+        for _, row in future_predictions.iterrows():
+            records.append({
+                "time": pd.Timestamp(row["date"]).strftime("%Y-%m-%d"),
+                "units_sold": None,
+                "predicted_demand": to_json_safe_value(row["predicted_demand"]),
+                "precipitation_sum": None,
+            })
+
+        records = sorted(records, key=lambda item: item["time"])
+
+        return {
+            "metrics": model_payload["metrics"],
+            "chart_data": records,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to build forecast series: {str(e)}")
 
