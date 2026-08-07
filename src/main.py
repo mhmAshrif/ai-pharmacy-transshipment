@@ -1,15 +1,20 @@
 # src/main.py
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
 import os
 import sys
 import math
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 # Append the project root to path to ensure crisp absolute internal source imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pandas as pd
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from src.database import get_db, test_db_connection
 # Import your working functional script methods
 from src.data_pipeline import fuse_healthcare_data
 from src.forecast_engine import build_prophet_forecast, generate_demand_forecasts
@@ -23,6 +28,11 @@ app = FastAPI(
     redoc_url=None,
     openapi_url="/openapi.json"
 )
+
+
+@app.on_event("startup")
+def on_startup():
+    test_db_connection()
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data", "processed")
@@ -156,29 +166,88 @@ def get_optimized_manifest():
         raise HTTPException(status_code=500, detail=f"Failed to read data matrix: {str(e)}")
 
 @app.get("/api/dashboard/metrics", tags=["Data Delivery Endpoints"])
-def get_dashboard_metrics():
+def get_dashboard_metrics(db: Optional[Session] = Depends(get_db)):
     """Returns the summary KPI numbers used on the overview dashboard."""
+    if db is not None:
+        try:
+            total_stock = db.execute(text("SELECT COALESCE(SUM(stock_quantity), 0) FROM inventory")).scalar() or 0
+            total_asset_value = db.execute(text("SELECT COALESCE(SUM(stock_quantity * unit_price), 0) FROM inventory")).scalar() or 0.0
+            expiring_stock_count = db.execute(text("SELECT COALESCE(COUNT(*), 0) FROM inventory WHERE expiry_days_remaining < 60")).scalar() or 0
+            active_manifest_count = db.execute(text(
+                "SELECT COALESCE(COUNT(*), 0) FROM transfer_manifests "
+                "WHERE status IN ('PENDING_DISPATCH', 'DISPATCHED')"
+            )).scalar() or 0
+
+            return {
+                "total_stock": int(total_stock),
+                "total_asset_value": float(total_asset_value),
+                "expiring_stock_count": int(expiring_stock_count),
+                "active_manifest_count": int(active_manifest_count),
+                "total_savings": float(total_asset_value),
+                "stock_saved": int(total_stock),
+                "active_manifests": int(active_manifest_count),
+            }
+        except (SQLAlchemyError, Exception) as exc:
+            print(f"⚠️ Dashboard metrics DB query failed: {exc}")
+
+    inventory_path = os.path.join(DATA_DIR, "fused_master_dataset.csv")
     manifest_path = os.path.join(DATA_DIR, "optimized_transshipment_manifest.csv")
-    if not os.path.exists(manifest_path):
-        return {"total_savings": 0, "stock_saved": 0, "active_manifests": 0}
+    total_stock = 0
+    total_asset_value = 0.0
+    expiring_stock_count = 0
+    active_manifest_count = 0
 
     try:
-        manifest_df = pd.read_csv(manifest_path)
-        total_savings = float(manifest_df["financial_value_saved_lkr"].sum()) if "financial_value_saved_lkr" in manifest_df.columns else 0.0
-        stock_saved = int(manifest_df["quantity_to_move"].sum()) if "quantity_to_move" in manifest_df.columns else 0
-        active_manifests = int(len(manifest_df))
-
+        if os.path.exists(inventory_path):
+            inventory_df = pd.read_csv(inventory_path)
+            quantity_col = "stock_quantity" if "stock_quantity" in inventory_df.columns else "stock_level"
+            inventory_df[quantity_col] = inventory_df[quantity_col].fillna(0).astype(float)
+            inventory_df["unit_price"] = inventory_df["unit_price"].fillna(0.0).astype(float)
+            total_stock = int(inventory_df[quantity_col].sum())
+            total_asset_value = float((inventory_df[quantity_col] * inventory_df["unit_price"]).sum())
+            expiring_stock_count = int(inventory_df[inventory_df["expiry_days_remaining"].fillna(0) < 60].shape[0])
+        if os.path.exists(manifest_path):
+            manifest_df = pd.read_csv(manifest_path)
+            active_manifest_count = int(manifest_df.shape[0])
         return {
-            "total_savings": round(total_savings, 2),
-            "stock_saved": stock_saved,
-            "active_manifests": active_manifests,
+            "total_stock": total_stock,
+            "total_asset_value": round(total_asset_value, 2),
+            "expiring_stock_count": expiring_stock_count,
+            "active_manifest_count": active_manifest_count,
+            "total_savings": round(total_asset_value, 2),
+            "stock_saved": total_stock,
+            "active_manifests": active_manifest_count,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to compute dashboard metrics: {str(e)}")
 
 @app.get("/api/dashboard/alerts", tags=["Data Delivery Endpoints"])
-def get_dashboard_alerts():
+def get_dashboard_alerts(db: Optional[Session] = Depends(get_db)):
     """Returns inventory alerts for the dashboard warning feed."""
+    if db is not None:
+        try:
+            query = text(
+                "SELECT district, medicine_name AS medicine, stock_quantity AS stock_level, expiry_days_remaining "
+                "FROM inventory "
+                "WHERE expiry_days_remaining < 60 OR stock_quantity < 500 "
+                "ORDER BY expiry_days_remaining ASC, stock_quantity ASC "
+                "LIMIT 8"
+            )
+            rows = db.execute(query).mappings().all()
+            if rows:
+                return [
+                    {
+                        "id": idx + 1,
+                        "district": str(row.get("district") or "Unknown"),
+                        "medicine": str(row.get("medicine") or "Unknown"),
+                        "stock_level": int(row.get("stock_level") or 0),
+                        "expiry_days_remaining": int(row.get("expiry_days_remaining") or 0),
+                    }
+                    for idx, row in enumerate(rows)
+                ]
+        except SQLAlchemyError as exc:
+            print(f"⚠️ Dashboard alerts DB query failed: {exc}")
+
     alerts_path = os.path.join(DATA_DIR, "fused_master_dataset.csv")
     if not os.path.exists(alerts_path):
         return []
@@ -230,22 +299,164 @@ def get_dashboard_chart():
         raise HTTPException(status_code=500, detail=f"Failed to build chart data: {str(e)}")
 
 @app.get("/api/inventory", tags=["Data Delivery Endpoints"])
-def get_inventory_records():
+def get_inventory_records(db: Optional[Session] = Depends(get_db)):
     """Returns the current inventory ledger rows used by the inventory page."""
+    if db is not None:
+        try:
+            rows = db.execute(text(
+                "SELECT district, medicine_name, category, stock_quantity, expiry_days_remaining, unit_price "
+                "FROM inventory"
+            )).mappings().all()
+            return [
+                {
+                    "district": str(row.get("district") or "Unknown"),
+                    "medicine_name": str(row.get("medicine_name") or "Unknown"),
+                    "category": str(row.get("category") or "Unknown"),
+                    "stock_quantity": int(row.get("stock_quantity") or 0),
+                    "expiry_days_remaining": int(row.get("expiry_days_remaining") or 0),
+                    "unit_price": float(row.get("unit_price") or 0.0),
+                }
+                for row in rows
+            ]
+        except (SQLAlchemyError, Exception) as exc:
+            print(f"⚠️ Inventory DB query failed: {exc}")
+
     inventory_path = os.path.join(DATA_DIR, "fused_master_dataset.csv")
     if not os.path.exists(inventory_path):
         return []
 
     try:
         inventory_df = pd.read_csv(inventory_path)
-        inventory_df = inventory_df[["district", "medicine", "category", "stock_level", "expiry_days_remaining", "unit_price"]].copy()
-        inventory_df = inventory_df.drop_duplicates().reset_index(drop=True)
-        inventory_df["stock_level"] = inventory_df["stock_level"].astype(int)
-        inventory_df["expiry_days_remaining"] = inventory_df["expiry_days_remaining"].astype(int)
-        inventory_df["unit_price"] = inventory_df["unit_price"].astype(float)
-        return inventory_df.to_dict(orient="records")
+        district_col = "district" if "district" in inventory_df.columns else "district"
+        medicine_col = "medicine" if "medicine" in inventory_df.columns else "medicine_name"
+        quantity_col = "stock_quantity" if "stock_quantity" in inventory_df.columns else "stock_level"
+        inventory_df["district"] = inventory_df[district_col].astype(str).fillna("Unknown")
+        inventory_df["medicine_name"] = inventory_df[medicine_col].astype(str).fillna("Unknown")
+        inventory_df["category"] = inventory_df["category"].astype(str).fillna("Unknown")
+        inventory_df["stock_quantity"] = inventory_df[quantity_col].fillna(0).astype(int)
+        inventory_df["expiry_days_remaining"] = inventory_df["expiry_days_remaining"].fillna(0).astype(int)
+        inventory_df["unit_price"] = inventory_df["unit_price"].fillna(0.0).astype(float)
+
+        return inventory_df[["district", "medicine_name", "category", "stock_quantity", "expiry_days_remaining", "unit_price"]].to_dict(orient="records")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read inventory data: {str(e)}")
+
+@app.get("/api/network/nodes", tags=["Data Delivery Endpoints"])
+def get_network_nodes(db: Optional[Session] = Depends(get_db)):
+    """Returns the spatial network nodes with active inbound/outbound counts and health status."""
+    node_definitions = [
+        {"district": "Colombo", "hospital_name": "Colombo General Node", "latitude": 6.9271, "longitude": 79.8612},
+        {"district": "Jaffna", "hospital_name": "Jaffna Teaching Hospital Node", "latitude": 9.6615, "longitude": 80.0255},
+        {"district": "Galle", "hospital_name": "Galle Regional Depot", "latitude": 6.0535, "longitude": 80.2210},
+        {"district": "Kandy", "hospital_name": "Kandy General Hospital", "latitude": 7.2906, "longitude": 80.6337},
+        {"district": "Anuradhapura", "hospital_name": "Anuradhapura Base Node", "latitude": 8.3114, "longitude": 80.4037},
+    ]
+
+    def build_node_from_row(district: str, row: Optional[Dict[str, Any]]):
+        total_stock = int(row.get("total_stock") or 0)
+        expiry_count_30 = int(row.get("expiry_count_30") or 0)
+        expiry_count_60 = int(row.get("expiry_count_60") or 0)
+        if total_stock < 1000 or expiry_count_30 > 0:
+            health_status = "CRITICAL"
+        elif total_stock < 2500 or expiry_count_60 > 0:
+            health_status = "WARNING"
+        else:
+            health_status = "HEALTHY"
+
+        return {
+            "id": 0,
+            "district": district,
+            "hospital_name": "",
+            "latitude": 0.0,
+            "longitude": 0.0,
+            "active_inbound": int(row.get("active_inbound") or 0),
+            "active_outbound": int(row.get("active_outbound") or 0),
+            "health_status": health_status,
+        }
+
+    if db is not None:
+        try:
+            query = text(
+                "SELECT d.district, "
+                "COALESCE(inv.total_stock, 0) AS total_stock, "
+                "COALESCE(inv.expiry_count_30, 0) AS expiry_count_30, "
+                "COALESCE(inv.expiry_count_60, 0) AS expiry_count_60, "
+                "COALESCE(inbound.active_inbound, 0) AS active_inbound, "
+                "COALESCE(outbound.active_outbound, 0) AS active_outbound "
+                "FROM (VALUES ('Colombo'), ('Jaffna'), ('Galle'), ('Kandy'), ('Anuradhapura')) AS d(district) "
+                "LEFT JOIN ( "
+                "  SELECT district, "
+                "    SUM(stock_quantity) AS total_stock, "
+                "    SUM(CASE WHEN expiry_days_remaining < 30 THEN 1 ELSE 0 END) AS expiry_count_30, "
+                "    SUM(CASE WHEN expiry_days_remaining < 60 THEN 1 ELSE 0 END) AS expiry_count_60 "
+                "  FROM inventory "
+                "  GROUP BY district "
+                ") AS inv ON inv.district = d.district "
+                "LEFT JOIN ( "
+                "  SELECT dest_district AS district, COUNT(*) FILTER (WHERE status IN ('PENDING_DISPATCH', 'DISPATCHED')) AS active_inbound "
+                "  FROM transfer_manifests "
+                "  GROUP BY dest_district "
+                ") AS inbound ON inbound.district = d.district "
+                "LEFT JOIN ( "
+                "  SELECT source_district AS district, COUNT(*) FILTER (WHERE status IN ('PENDING_DISPATCH', 'DISPATCHED')) AS active_outbound "
+                "  FROM transfer_manifests "
+                "  GROUP BY source_district "
+                ") AS outbound ON outbound.district = d.district "
+                "ORDER BY d.district"
+            )
+            rows = db.execute(query).mappings().all()
+            row_map = {row["district"]: row for row in rows}
+            nodes = []
+            for idx, node in enumerate(node_definitions, start=1):
+                raw_row = row_map.get(node["district"], {})
+                node_payload = build_node_from_row(node["district"], raw_row)
+                node_payload["id"] = idx
+                node_payload["hospital_name"] = node["hospital_name"]
+                node_payload["latitude"] = node["latitude"]
+                node_payload["longitude"] = node["longitude"]
+                nodes.append(node_payload)
+            return nodes
+        except SQLAlchemyError as exc:
+            print(f"⚠️ Network nodes DB query failed: {exc}")
+
+    source_path = os.path.join(DATA_DIR, "fused_master_dataset.csv")
+    if not os.path.exists(source_path):
+        return []
+
+    try:
+        inventory_df = pd.read_csv(source_path)
+        inventory_df["district"] = inventory_df["district"].astype(str)
+        inventory_df["status"] = inventory_df.get("status", pd.Series(["PENDING_DISPATCH"] * len(inventory_df))).astype(str)
+
+        nodes = []
+        for idx, node in enumerate(node_definitions, start=1):
+            node_df = inventory_df[inventory_df["district"].str.lower() == node["district"].lower()]
+            active_inbound = int(node_df[node_df["status"].isin(["PENDING_DISPATCH", "DISPATCHED"])].shape[0])
+            active_outbound = int(node_df[node_df["status"].isin(["PENDING_DISPATCH", "DISPATCHED"])].shape[0])
+            total_stock = int(node_df["stock_level"].fillna(0).sum())
+            expiry_count_30 = int(node_df[node_df["expiry_days_remaining"] < 30].shape[0])
+            expiry_count_60 = int(node_df[node_df["expiry_days_remaining"] < 60].shape[0])
+
+            if total_stock < 1000 or expiry_count_30 > 0:
+                health_status = "CRITICAL"
+            elif total_stock < 2500 or expiry_count_60 > 0:
+                health_status = "WARNING"
+            else:
+                health_status = "HEALTHY"
+
+            nodes.append({
+                "id": idx,
+                "district": node["district"],
+                "hospital_name": node["hospital_name"],
+                "latitude": node["latitude"],
+                "longitude": node["longitude"],
+                "active_inbound": active_inbound,
+                "active_outbound": active_outbound,
+                "health_status": health_status,
+            })
+        return nodes
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to compute network topology: {str(e)}")
 
 @app.get("/api/optimizer/manifests", tags=["Optimizer Endpoints"])
 def get_optimizer_manifests():
