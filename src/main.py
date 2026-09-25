@@ -2,6 +2,9 @@
 import os
 import sys
 import math
+import threading
+import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 # Append the project root to path to ensure crisp absolute internal source imports
@@ -10,11 +13,13 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
+from sqlalchemy import text, func, or_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from src.database import get_db, test_db_connection
+from src.database import get_db, test_db_connection, init_db, seed_initial_inventory, ensure_reference_lookup_tables, cleanup_duplicate_transfer_manifests, backfill_inventory_foreign_keys, SessionLocal
+from src.models import Inventory, TransferManifest, ForecastMetric, District, Medicine, AuditLog
+from sqlalchemy import text
 # Import your working functional script methods
 from src.data_pipeline import fuse_healthcare_data
 from src.forecast_engine import build_prophet_forecast, generate_demand_forecasts
@@ -32,18 +37,34 @@ app = FastAPI(
 
 @app.on_event("startup")
 def on_startup():
-    test_db_connection()
+    ok = test_db_connection()
+    if ok:
+        # Ensure DB schema exists and seed inventory from CSV if empty
+        init_db()
+        try:
+            if SessionLocal is not None:
+                db = SessionLocal()
+                try:
+                    inserted = seed_initial_inventory(db)
+                    if inserted:
+                        print(f"Seeded inventory with {inserted} rows from CSV.")
+                finally:
+                    db.close()
+        except Exception as exc:
+            print(f"Warning: seeding initial inventory failed: {exc}")
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data", "processed")
 
+PIPELINE_LOCK = threading.Lock()
 OPTIMIZER_STATE: Dict[str, object] = {
     "manifests": [],
     "last_run": None,
+    "running": False,
 }
 
 
-def _load_optimizer_manifest_rows() -> List[Dict[str, object]]:
+def _load_optimizer_manifest_rows(db: Optional[Session] = None) -> List[Dict[str, object]]:
     manifest_path = os.path.join(DATA_DIR, "optimized_transshipment_manifest.csv")
     if not os.path.exists(manifest_path):
         return []
@@ -59,16 +80,48 @@ def _load_optimizer_manifest_rows() -> List[Dict[str, object]]:
         destination_hospital = str(row.get("destination_hospital") or row.get("destination_district") or "Unknown")
         quantity_to_move = int(row.get("quantity_to_move", 0) or 0)
         transport_cost = float(row.get("logistical_cost_lkr", row.get("transport_cost", 0)) or 0.0)
-        net_savings = float(row.get("financial_value_saved_lkr", row.get("net_savings", 0)) or 0.0)
+        expiring_asset_value = float(row.get("financial_value_saved_lkr", row.get("expiring_asset_value", 0)) or 0.0)
+        net_savings = float(row.get("net_savings", 0) or 0.0)
         status = "PENDING_DISPATCH"
+        database_id = None
+
+        if db is not None:
+            persisted = db.execute(
+                text("""
+                    SELECT tm.id, tm.status
+                    FROM public.transfer_manifests tm
+                    JOIN public.districts sd ON sd.id = tm.source_district_id
+                    JOIN public.districts dd ON dd.id = tm.dest_district_id
+                    JOIN public.medicines m ON m.id = tm.medicine_id
+                    WHERE LOWER(sd.name) = LOWER(:source)
+                      AND LOWER(dd.name) = LOWER(:destination)
+                      AND LOWER(m.name) = LOWER(:medicine)
+                      AND tm.quantity_to_move = :quantity
+                    ORDER BY tm.id DESC
+                    LIMIT 1
+                """),
+                {
+                    "source": source_hospital,
+                    "destination": destination_hospital,
+                    "medicine": str(row.get("medicine", "Unknown")),
+                    "quantity": quantity_to_move,
+                },
+            ).first()
+            if persisted:
+                database_id, persisted_status = persisted
+                status = str(persisted_status)
+            else:
+                database_id = None
 
         rows.append({
             "id": index + 1,
+            "database_id": database_id,
             "source_district": source_hospital,
             "dest_district": destination_hospital,
             "medicine": str(row.get("medicine", "Unknown")),
             "quantity_to_move": quantity_to_move,
             "transport_cost": transport_cost,
+            "expiring_asset_value": expiring_asset_value,
             "net_savings": net_savings,
             "status": status,
         })
@@ -76,8 +129,8 @@ def _load_optimizer_manifest_rows() -> List[Dict[str, object]]:
     return rows
 
 
-def _sync_optimizer_state() -> List[Dict[str, object]]:
-    persisted_rows = _load_optimizer_manifest_rows()
+def _sync_optimizer_state(db: Optional[Session] = None) -> List[Dict[str, object]]:
+    persisted_rows = _load_optimizer_manifest_rows(db)
     if persisted_rows:
         OPTIMIZER_STATE["manifests"] = persisted_rows
     elif not OPTIMIZER_STATE["manifests"]:
@@ -93,6 +146,7 @@ def _serialize_manifest(manifest: Dict[str, object]) -> Dict[str, object]:
         "medicine": manifest.get("medicine"),
         "quantity_to_move": manifest.get("quantity_to_move"),
         "transport_cost": manifest.get("transport_cost"),
+        "expiring_asset_value": manifest.get("expiring_asset_value"),
         "net_savings": manifest.get("net_savings"),
         "status": manifest.get("status"),
     }
@@ -119,29 +173,231 @@ app.add_middleware(
 )
 
 @app.api_route("/api/pipeline/run-all", methods=["GET", "POST"], tags=["Core Pipeline Orchestration"])
-def execute_system_pipeline():
+def execute_system_pipeline(db: Optional[Session] = Depends(get_db)):
     """
     Executes Phase 1, Phase 2, and Phase 3 of the framework consecutively.
     Fuses environmental weather data, generates Facebook Prophet forecasts, and runs PuLP optimization.
     """
-    try:
-        print("\n--- Triggering Full API-Driven Orchestration Chain ---")
-        # 1. Run Data Preprocessing and Fusion
-        fuse_healthcare_data()
-        
-        # 2. Trigger Facebook Prophet Forecasting Brain
-        generate_demand_forecasts()
-        
-        # 3. Compute cost-optimal routing manifests via Linear Programming
-        optimized_manifest = run_transshipment_optimization()
-        
+    if OPTIMIZER_STATE.get("running"):
         return {
-            "status": "Success",
-            "message": "Entire automated forecasting and redistribution optimization cycle completed.",
-            "total_routes_generated": len(optimized_manifest)
+            "status": "Busy",
+            "message": "Pipeline already running. Please wait for the current execution to finish.",
+            "total_routes_generated": len(OPTIMIZER_STATE.get("manifests", [])),
+            "total_net_savings_lkr": 0.0,
+            "rejected_unprofitable_route_count": 0,
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Pipeline Orchestration Failed: {str(e)}")
+
+    with PIPELINE_LOCK:
+        if OPTIMIZER_STATE.get("running"):
+            return {
+                "status": "Busy",
+                "message": "Pipeline already running. Please wait for the current execution to finish.",
+                "total_routes_generated": len(OPTIMIZER_STATE.get("manifests", [])),
+                "total_net_savings_lkr": 0.0,
+                "rejected_unprofitable_route_count": 0,
+            }
+
+        OPTIMIZER_STATE["running"] = True
+        try:
+            print("\n--- Triggering Full API-Driven Orchestration Chain ---")
+            # 1. Run Data Preprocessing and Fusion
+            fuse_healthcare_data()
+
+            # 2. Trigger Facebook Prophet Forecasting Brain
+            generate_demand_forecasts()
+
+            # 2.b Persist forecast evaluation metrics into DB if available
+            try:
+                metrics_path = os.path.join(DATA_DIR, "forecast_evaluation_metrics.csv")
+                if db is not None and os.path.exists(metrics_path):
+                    import pandas as pd
+
+                    metrics_df = pd.read_csv(metrics_path)
+                    metric_objs = []
+                    for _, row in metrics_df.iterrows():
+                        try:
+                            metric_objs.append(
+                                ForecastMetric(
+                                    district=str(row.get("district") or "").strip(),
+                                    medicine_name=str(row.get("medicine") or "").strip(),
+                                    rmse=float(row.get("rmse") or 0.0),
+                                    mae=float(row.get("mae") or 0.0),
+                                    mape=float(row.get("mape") or 0.0),
+                                    best_changepoint_prior=float(row.get("best_changepoint_prior") or 0.0),
+                                    best_seasonality_prior=float(row.get("best_seasonality_prior") or 0.0),
+                                    evaluated_at=datetime.utcnow(),
+                                )
+                            )
+                        except Exception:
+                            continue
+                    if metric_objs:
+                        try:
+                            db.bulk_save_objects(metric_objs)
+                            db.commit()
+                            print(f"Persisted {len(metric_objs)} forecast metric rows to DB.")
+                        except Exception as exc:
+                            db.rollback()
+                            print(f"Warning: failed to persist forecast metrics: {exc}")
+            except Exception as exc:
+                print(f"Warning: forecast metrics persistence step failed: {exc}")
+
+            # 3. Compute cost-optimal routing manifests via Linear Programming
+            optimization_result = run_transshipment_optimization()
+            optimized_manifest = optimization_result.get("manifest", [])
+            rejected_candidates = optimization_result.get("rejected_candidates", [])
+
+            audit_entries = []
+            approvals = []
+            rejections = []
+
+            if db is not None:
+                try:
+                    ensure_reference_lookup_tables(db)
+                    backfill_inventory_foreign_keys(db)
+                    cleanup_duplicate_transfer_manifests(db)
+                    # Clear existing PENDING_DISPATCH manifests to avoid duplication and ID jumping across runs
+                    deleted_count = db.execute(text("DELETE FROM public.transfer_manifests WHERE status = 'PENDING_DISPATCH'")).rowcount
+                    if deleted_count > 0:
+                        print(f"Cleared {deleted_count} stale PENDING_DISPATCH manifests before inserting new routes.")
+                    db.commit()
+                    db.execute(text("DELETE FROM public.transfer_manifests WHERE source_district_id IS NULL OR dest_district_id IS NULL OR medicine_id IS NULL"))
+                    db.commit()
+
+                    # Build case-insensitive lookup maps for districts and medicines using the
+                    # fully backfilled reference tables and the inventory-sourced FK map.
+                    district_rows = db.query(District).all()
+                    district_map = {}
+                    for d in district_rows:
+                        name_val = getattr(d, "name", None) or getattr(d, "district", "")
+                        if name_val:
+                            district_map[name_val.strip().lower()] = d.id
+
+                    medicine_rows = db.query(Medicine).all()
+                    medicine_map = {}
+                    for m in medicine_rows:
+                        name_val = getattr(m, "name", None) or getattr(m, "medicine", "")
+                        if name_val:
+                            medicine_map[name_val.strip().lower()] = m.id
+
+                    inventory_id_map = db.execute(text(
+                        "SELECT DISTINCT district, district_id, medicine, medicine_id FROM public.inventory WHERE district IS NOT NULL AND medicine IS NOT NULL"
+                    )).mappings().all()
+                    for row in inventory_id_map:
+                        district_name = (row.get("district") or "").strip().lower()
+                        medicine_name = (row.get("medicine") or "").strip().lower()
+                        if district_name and row.get("district_id") is not None:
+                            district_map.setdefault(district_name, row["district_id"])
+                        if medicine_name and row.get("medicine_id") is not None:
+                            medicine_map.setdefault(medicine_name, row["medicine_id"])
+
+                    existing_manifest_keys = set(db.execute(text(
+                        "SELECT source_district_id, dest_district_id, medicine_id, quantity_to_move FROM public.transfer_manifests WHERE source_district_id IS NOT NULL AND dest_district_id IS NOT NULL AND medicine_id IS NOT NULL"
+                    )).fetchall())
+
+                    # Prepare ORM objects for a single atomic insert, and skip duplicates/unresolved rows.
+                    seen_keys = set(existing_manifest_keys)
+                    manifest_objs = []
+                    for r in optimized_manifest:
+                        med_name = (r.get("medicine") or r.get("medicine_name") or "").strip()
+                        src_name = (r.get("source_district") or r.get("source_hospital") or "").strip()
+                        dst_name = (r.get("dest_district") or r.get("destination_hospital") or "").strip()
+                        qty = int(r.get("quantity_to_move", 0) or 0)
+                        transport_cost = float(r.get("transport_cost", r.get("logistical_cost_lkr", 0)) or 0.0)
+                        net_savings = float(r.get("net_savings", 0) or 0.0)
+                        unit_price = float(r.get("unit_price_lkr", 0) or 0.0)
+
+                        src_id = district_map.get(src_name.lower())
+                        dst_id = district_map.get(dst_name.lower())
+                        med_id = medicine_map.get(med_name.lower())
+
+                        if src_id is None or dst_id is None or med_id is None:
+                            print(f"Skipping manifest row due to unresolved FK: medicine={med_name!r}, source={src_name!r}, destination={dst_name!r}")
+                            continue
+
+                        key = (src_id, dst_id, med_id, qty)
+                        if key in seen_keys:
+                            print(f"Skipping duplicate manifest key: {key}")
+                            continue
+                        seen_keys.add(key)
+
+                        manifest_objs.append(
+                            TransferManifest(
+                                source_district_id=src_id,
+                                dest_district_id=dst_id,
+                                medicine_id=med_id,
+                                quantity_to_move=qty,
+                                transport_cost=transport_cost,
+                                expiring_asset_value=qty * unit_price,
+                                net_savings=net_savings,
+                                status=r.get("status", "PENDING_DISPATCH"),
+                            )
+                        )
+
+                    # Atomic bulk insert
+                    try:
+                        if manifest_objs:
+                            db.add_all(manifest_objs)
+                            db.commit()
+                            # Build approvals list with persisted IDs
+                            for obj in manifest_objs:
+                                approvals.append(
+                                    {
+                                        "manifest_id": getattr(obj, "id", None),
+                                        "source_district_id": getattr(obj, "source_district_id", None),
+                                        "dest_district_id": getattr(obj, "dest_district_id", None),
+                                        "medicine_id": getattr(obj, "medicine_id", None),
+                                        "source_district": None,
+                                        "destination_district": None,
+                                        "medicine_name": None,
+                                        "quantity": getattr(obj, "quantity_to_move", 0),
+                                        "transport_cost": getattr(obj, "transport_cost", 0.0),
+                                        "net_savings": getattr(obj, "net_savings", 0.0),
+                                    }
+                                )
+                    except Exception as e:
+                        db.rollback()
+                        print(f"Manifest persistence error: {e}")
+
+                    # Persist rejected candidates as audit logs
+                    # Persist rejected candidates as audit logs in a single batch to avoid per-row commits
+                    try:
+                        audit_objs = []
+                        for rc in rejected_candidates:
+                            audit_objs.append(
+                                AuditLog(
+                                    action="REJECT_ROUTE",
+                                    entity_type="transfer_candidate",
+                                    entity_id=None,
+                                    user_id=None,
+                                    details=rc,
+                                )
+                            )
+                            rejections.append(rc)
+
+                        if audit_objs:
+                            db.bulk_save_objects(audit_objs)
+                            db.commit()
+                    except Exception:
+                        db.rollback()
+                except Exception as exc:
+                    print(f"Warning: manifest persistence/audit failed: {exc}")
+
+            OPTIMIZER_STATE["manifests"] = optimized_manifest
+            OPTIMIZER_STATE["last_run"] = time.time()
+            total_net_savings = optimization_result.get("total_net_savings_lkr", 0.0)
+            rejected_routes = optimization_result.get("rejected_unprofitable_route_count", 0)
+
+            return {
+                "status": "Success",
+                "message": "Entire automated forecasting and redistribution optimization cycle completed.",
+                "total_routes_generated": len(optimized_manifest),
+                "total_net_savings_lkr": total_net_savings,
+                "rejected_unprofitable_route_count": rejected_routes,
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Pipeline Orchestration Failed: {str(e)}")
+        finally:
+            OPTIMIZER_STATE["running"] = False
 
 @app.get("/api/dashboard/manifest", tags=["Data Delivery Endpoints"])
 def get_optimized_manifest():
@@ -157,7 +413,14 @@ def get_optimized_manifest():
     
     try:
         manifest_df = pd.read_csv(path)
-        records = manifest_df.to_dict(orient="records")
+        records = []
+        for _, row in manifest_df.iterrows():
+            record = row.to_dict()
+            record["expiring_asset_value"] = float(
+                row.get("financial_value_saved_lkr", row.get("expiring_asset_value", 0)) or 0.0
+            )
+            record["net_savings"] = float(row.get("net_savings", 0) or 0.0)
+            records.append(record)
         return {
             "count": len(records),
             "data": records
@@ -170,25 +433,24 @@ def get_dashboard_metrics(db: Optional[Session] = Depends(get_db)):
     """Returns the summary KPI numbers used on the overview dashboard."""
     if db is not None:
         try:
-            total_stock = db.execute(text("SELECT COALESCE(SUM(stock_quantity), 0) FROM inventory")).scalar() or 0
-            total_asset_value = db.execute(text("SELECT COALESCE(SUM(stock_quantity * unit_price), 0) FROM inventory")).scalar() or 0.0
-            expiring_stock_count = db.execute(text("SELECT COALESCE(COUNT(*), 0) FROM inventory WHERE expiry_days_remaining < 60")).scalar() or 0
-            active_manifest_count = db.execute(text(
-                "SELECT COALESCE(COUNT(*), 0) FROM transfer_manifests "
-                "WHERE status IN ('PENDING_DISPATCH', 'DISPATCHED')"
-            )).scalar() or 0
+            total_stock = db.query(func.coalesce(func.sum(Inventory.stock_quantity), 0)).scalar() or 0
+            total_asset_value = db.query(func.coalesce(func.sum(Inventory.stock_quantity * Inventory.unit_price), 0)).scalar() or 0.0
+            expiring_stock_count = db.query(func.count()).filter(Inventory.expiry_days_remaining < 60).scalar() or 0
+            active_manifest_count = db.query(func.count()).select_from(TransferManifest).filter(TransferManifest.status.in_(("PENDING_DISPATCH", "DISPATCHED"))).scalar() or 0
 
             return {
                 "total_stock": int(total_stock),
                 "total_asset_value": float(total_asset_value),
                 "expiring_stock_count": int(expiring_stock_count),
                 "active_manifest_count": int(active_manifest_count),
-                "total_savings": float(total_asset_value),
+                "total_savings": float(
+                    db.query(func.coalesce(func.sum(TransferManifest.net_savings), 0)).scalar() or 0.0
+                ),
                 "stock_saved": int(total_stock),
                 "active_manifests": int(active_manifest_count),
             }
         except (SQLAlchemyError, Exception) as exc:
-            print(f"⚠️ Dashboard metrics DB query failed: {exc}")
+            print(f"⚠️ Dashboard metrics DB query failed, falling back to CSV: {exc}")
 
     inventory_path = os.path.join(DATA_DIR, "fused_master_dataset.csv")
     manifest_path = os.path.join(DATA_DIR, "optimized_transshipment_manifest.csv")
@@ -209,12 +471,15 @@ def get_dashboard_metrics(db: Optional[Session] = Depends(get_db)):
         if os.path.exists(manifest_path):
             manifest_df = pd.read_csv(manifest_path)
             active_manifest_count = int(manifest_df.shape[0])
+            total_net_savings = float(manifest_df.get("net_savings", pd.Series(dtype=float)).fillna(0).sum())
+        else:
+            total_net_savings = 0.0
         return {
             "total_stock": total_stock,
             "total_asset_value": round(total_asset_value, 2),
             "expiring_stock_count": expiring_stock_count,
             "active_manifest_count": active_manifest_count,
-            "total_savings": round(total_asset_value, 2),
+            "total_savings": round(total_net_savings, 2),
             "stock_saved": total_stock,
             "active_manifests": active_manifest_count,
         }
@@ -226,27 +491,26 @@ def get_dashboard_alerts(db: Optional[Session] = Depends(get_db)):
     """Returns inventory alerts for the dashboard warning feed."""
     if db is not None:
         try:
-            query = text(
-                "SELECT district, medicine_name AS medicine, stock_quantity AS stock_level, expiry_days_remaining "
-                "FROM inventory "
-                "WHERE expiry_days_remaining < 60 OR stock_quantity < 500 "
-                "ORDER BY expiry_days_remaining ASC, stock_quantity ASC "
-                "LIMIT 8"
+            rows = (
+                db.query(Inventory)
+                .filter(or_(Inventory.expiry_days_remaining < 60, Inventory.stock_quantity < 500))
+                .order_by(Inventory.expiry_days_remaining.asc(), Inventory.stock_quantity.asc())
+                .limit(8)
+                .all()
             )
-            rows = db.execute(query).mappings().all()
             if rows:
                 return [
                     {
                         "id": idx + 1,
-                        "district": str(row.get("district") or "Unknown"),
-                        "medicine": str(row.get("medicine") or "Unknown"),
-                        "stock_level": int(row.get("stock_level") or 0),
-                        "expiry_days_remaining": int(row.get("expiry_days_remaining") or 0),
+                        "district": getattr(r, "district", "Unknown"),
+                        "medicine": getattr(r, "medicine_name", "Unknown"),
+                        "stock_level": int(getattr(r, "stock_quantity", 0) or 0),
+                        "expiry_days_remaining": int(getattr(r, "expiry_days_remaining", 0) or 0),
                     }
-                    for idx, row in enumerate(rows)
+                    for idx, r in enumerate(rows)
                 ]
         except SQLAlchemyError as exc:
-            print(f"⚠️ Dashboard alerts DB query failed: {exc}")
+            print(f"⚠️ Dashboard alerts DB query failed, falling back to CSV: {exc}")
 
     alerts_path = os.path.join(DATA_DIR, "fused_master_dataset.csv")
     if not os.path.exists(alerts_path):
@@ -459,9 +723,9 @@ def get_network_nodes(db: Optional[Session] = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Failed to compute network topology: {str(e)}")
 
 @app.get("/api/optimizer/manifests", tags=["Optimizer Endpoints"])
-def get_optimizer_manifests():
+def get_optimizer_manifests(db: Optional[Session] = Depends(get_db)):
     """Returns the current optimizer manifest queue for the dispatch UI."""
-    manifests = _sync_optimizer_state()
+    manifests = _sync_optimizer_state(db)
     return [_serialize_manifest(manifest) for manifest in manifests]
 
 
@@ -482,9 +746,9 @@ def run_optimizer_sweep():
 
 
 @app.patch("/api/optimizer/manifests/{manifest_id}/dispatch", tags=["Optimizer Endpoints"])
-def dispatch_optimizer_manifest(manifest_id: str):
-    """Approves a pending transfer and updates the manifest status locally."""
-    manifests = _sync_optimizer_state()
+def dispatch_optimizer_manifest(manifest_id: str, db: Optional[Session] = Depends(get_db)):
+    """Approve a transfer, persist its status, and record an immutable audit event."""
+    manifests = _sync_optimizer_state(db)
     target_manifest = None
 
     for manifest in manifests:
@@ -495,10 +759,150 @@ def dispatch_optimizer_manifest(manifest_id: str):
     if target_manifest is None:
         raise HTTPException(status_code=404, detail="Manifest not found")
 
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable; dispatch cannot be persisted")
+
+    try:
+        persisted_id = target_manifest.get("database_id")
+        if persisted_id is None:
+            persisted_id = db.execute(
+                text("""
+                    SELECT tm.id
+                    FROM public.transfer_manifests tm
+                    JOIN public.districts sd ON sd.id = tm.source_district_id
+                    JOIN public.districts dd ON dd.id = tm.dest_district_id
+                    JOIN public.medicines m ON m.id = tm.medicine_id
+                    WHERE LOWER(sd.name) = LOWER(:source)
+                      AND LOWER(dd.name) = LOWER(:destination)
+                      AND LOWER(m.name) = LOWER(:medicine)
+                      AND tm.quantity_to_move = :quantity
+                    ORDER BY tm.id DESC
+                    LIMIT 1
+                """),
+                {
+                    "source": target_manifest.get("source_district"),
+                    "destination": target_manifest.get("dest_district"),
+                    "medicine": target_manifest.get("medicine"),
+                    "quantity": int(target_manifest.get("quantity_to_move") or 0),
+                },
+            ).scalar()
+        if persisted_id is None:
+            raise HTTPException(status_code=404, detail="Persisted manifest not found")
+
+        db.execute(
+            text("UPDATE public.transfer_manifests SET status = 'DISPATCHED' WHERE id = :manifest_id"),
+            {"manifest_id": persisted_id},
+        )
+        db.add(
+            AuditLog(
+                action="DISPATCH_APPROVED",
+                entity_type="transfer_manifest",
+                entity_id=int(persisted_id),
+                user_id="Hospital Admin",
+                details={
+                    "manifest_id": int(persisted_id),
+                    "performed_by": "Hospital Admin",
+                    "timestamp": datetime.utcnow().isoformat(),
+                },
+                timestamp=datetime.utcnow(),
+            )
+        )
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to persist dispatch approval: {exc}")
+
     target_manifest["status"] = "DISPATCHED"
     return {
         "status": "success",
         "message": "Manifest approved and dispatched.",
+        "manifest": _serialize_manifest(target_manifest),
+    }
+
+
+@app.patch("/api/optimizer/manifests/{manifest_id}/undo", tags=["Optimizer Endpoints"])
+def undo_optimizer_manifest(manifest_id: str, db: Optional[Session] = Depends(get_db)):
+    """Revert a dispatched transfer to pending and record the undo event."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable; dispatch cannot be reverted")
+
+    manifests = _sync_optimizer_state(db)
+    target_manifest = next(
+        (manifest for manifest in manifests if str(manifest.get("id")) == str(manifest_id)),
+        None,
+    )
+    if target_manifest is None:
+        raise HTTPException(status_code=404, detail="Manifest not found")
+
+    try:
+        persisted_id = target_manifest.get("database_id")
+        if persisted_id is None:
+            persisted_id = db.execute(
+                text("""
+                    SELECT tm.id
+                    FROM public.transfer_manifests tm
+                    JOIN public.districts sd ON sd.id = tm.source_district_id
+                    JOIN public.districts dd ON dd.id = tm.dest_district_id
+                    JOIN public.medicines m ON m.id = tm.medicine_id
+                    WHERE LOWER(sd.name) = LOWER(:source)
+                      AND LOWER(dd.name) = LOWER(:destination)
+                      AND LOWER(m.name) = LOWER(:medicine)
+                      AND tm.quantity_to_move = :quantity
+                    ORDER BY tm.id DESC
+                    LIMIT 1
+                """),
+                {
+                    "source": target_manifest.get("source_district"),
+                    "destination": target_manifest.get("dest_district"),
+                    "medicine": target_manifest.get("medicine"),
+                    "quantity": int(target_manifest.get("quantity_to_move") or 0),
+                },
+            ).scalar()
+        if persisted_id is None:
+            raise HTTPException(status_code=404, detail="Persisted manifest not found")
+
+        database_manifest_id = persisted_id
+        current_status = db.execute(
+            text("SELECT status FROM public.transfer_manifests WHERE id = :manifest_id"),
+            {"manifest_id": database_manifest_id},
+        ).scalar()
+        if current_status != "DISPATCHED":
+            raise HTTPException(status_code=400, detail="Only dispatched manifests can be reverted")
+
+        db.execute(
+            text("UPDATE public.transfer_manifests SET status = 'PENDING_DISPATCH' WHERE id = :manifest_id"),
+            {"manifest_id": database_manifest_id},
+        )
+        audit_timestamp = datetime.utcnow()
+        db.add(
+            AuditLog(
+                action="DISPATCH_REVERTED_UNDO",
+                entity_type="transfer_manifest",
+                entity_id=int(database_manifest_id),
+                user_id="Hospital Admin",
+                details={
+                    "manifest_id": int(database_manifest_id),
+                    "performed_by": "Hospital Admin",
+                    "timestamp": audit_timestamp.isoformat(),
+                },
+                timestamp=audit_timestamp,
+            )
+        )
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to revert dispatch: {exc}")
+
+    target_manifest["status"] = "PENDING_DISPATCH"
+    return {
+        "status": "success",
+        "message": "Transfer reverted to Pending",
         "manifest": _serialize_manifest(target_manifest),
     }
 
@@ -554,14 +958,43 @@ def get_forecast_series(medicine: str, district: str):
                 "chart_data": [],
             }
 
-        model_payload = build_prophet_forecast(
-            district=district,
-            medicine=medicine,
-            historical_df=historical_df,
-            forecast_horizon=30,
-        )
+        forecast_path = os.path.join(DATA_DIR, "upcoming_demand_forecasts.csv")
+        metrics_path = os.path.join(DATA_DIR, "forecast_evaluation_metrics.csv")
+        future_predictions = pd.DataFrame(columns=["date", "predicted_demand"])
+        model_metrics = {"rmse": 0.0, "mae": 0.0, "mape": 0.0}
 
-        future_predictions = model_payload["future_predictions"].copy()
+        if os.path.exists(forecast_path):
+            cached_forecasts = pd.read_csv(forecast_path)
+            cached_forecasts["date"] = pd.to_datetime(cached_forecasts["date"], errors="coerce")
+            future_predictions = cached_forecasts[
+                (cached_forecasts["district"].astype(str).str.lower() == district.lower()) &
+                (cached_forecasts["medicine"].astype(str).str.lower() == medicine.lower())
+            ][["date", "predicted_demand"]].dropna(subset=["date"])
+
+        if os.path.exists(metrics_path):
+            metrics_df = pd.read_csv(metrics_path)
+            metric_rows = metrics_df[
+                (metrics_df["district"].astype(str).str.lower() == district.lower()) &
+                (metrics_df["medicine"].astype(str).str.lower() == medicine.lower())
+            ]
+            if not metric_rows.empty:
+                metric_row = metric_rows.iloc[-1]
+                model_metrics = {
+                    "rmse": float(metric_row.get("rmse", 0.0) or 0.0),
+                    "mae": float(metric_row.get("mae", 0.0) or 0.0),
+                    "mape": float(metric_row.get("mape", 0.0) or 0.0),
+                }
+
+        if future_predictions.empty:
+            model_payload = build_prophet_forecast(
+                district=district,
+                medicine=medicine,
+                historical_df=historical_df,
+                forecast_horizon=30,
+            )
+            future_predictions = model_payload["future_predictions"].copy()
+            model_metrics = model_payload["metrics"]
+
         historical_subset = historical_subset[["date", "units_sold", "precipitation_sum"]].copy()
         historical_subset = historical_subset.sort_values("date").reset_index(drop=True)
 
@@ -600,7 +1033,11 @@ def get_forecast_series(medicine: str, district: str):
         records = sorted(records, key=lambda item: item["time"])
 
         return {
-            "metrics": model_payload["metrics"],
+            "metrics": {
+                "rmse": model_metrics.get("rmse"),
+                "mae": model_metrics.get("mae"),
+                "mape_percent": model_metrics.get("mape"),
+            },
             "chart_data": records,
         }
     except Exception as e:
